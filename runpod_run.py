@@ -1,4 +1,4 @@
-"""Run a 2048x2048 PyTorch matmul remotely on Runpod B200.
+"""Run a PyTorch matmul remotely on Runpod B200.
 
 Usage:
     pip install runpod-flash
@@ -17,14 +17,42 @@ import json
 import os
 from pathlib import Path
 
-from matmul_worker import DEFAULT_DIM, DEFAULT_DTYPE, TARGET_GPU, run_matmul
+from runpod_flash import GpuType, LiveServerless, remote
+
+from kernel_1_naive import DEFAULT_DIM, DEFAULT_DTYPE, DTYPE_CHOICES, run_matmul_local
 
 PROJECT_DIR = Path(__file__).resolve().parent
+WORKER_NAME = "matmul-2048-b200"
+TARGET_GPU = GpuType.NVIDIA_B200
+RUNPOD_GPU_NAME = TARGET_GPU.name
+
+gpu_config = LiveServerless(
+    name=WORKER_NAME,
+    gpus=[TARGET_GPU],
+    workersMin=0,
+    workersMax=1,
+    idleTimeout=5,
+)
+
+
+@remote(
+    resource_config=gpu_config,
+    dependencies=["torch"],
+)
+async def run_matmul(
+    dim: int = DEFAULT_DIM,
+    dtype: str = DEFAULT_DTYPE,
+) -> dict:
+    """Execute the matmul benchmark on a remote Runpod worker."""
+    result = run_matmul_local(dim=dim, dtype=dtype)
+    result["backend"] = "runpod"
+    result["requested_gpu"] = RUNPOD_GPU_NAME
+    return result
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a 2048x2048 PyTorch matmul on Runpod B200."
+        description="Run a PyTorch matmul benchmark on Runpod B200."
     )
     parser.add_argument(
         "--dim",
@@ -34,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        choices=("float16", "float32", "bfloat16"),
+        choices=DTYPE_CHOICES,
         default=DEFAULT_DTYPE,
         help=f"PyTorch dtype to use (default: {DEFAULT_DTYPE}).",
     )
@@ -51,7 +79,7 @@ async def main() -> None:
     args = parse_args()
     print(
         f"Dispatching torch.matmul for {args.dim}x{args.dim} matrices "
-        f"on Runpod {TARGET_GPU.name}..."
+        f"on Runpod {RUNPOD_GPU_NAME}..."
     )
     result = await run_matmul(dim=args.dim, dtype=args.dtype)
     print(json.dumps(result, indent=2, sort_keys=True))
