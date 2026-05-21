@@ -26,7 +26,7 @@ if Path(REMOTE_PROJECT_DIR).exists() and REMOTE_PROJECT_DIR not in sys.path:
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DIM = 4096
 DEFAULT_KERNEL = "kernel_2_tensor_core"
-KERNEL_CHOICES = ("kernel_1_naive", "kernel_2_tensor_core")
+KERNEL_CHOICES = ("kernel_1_naive", "kernel_2_tensor_core", "kernel_4_stmatrix")
 MODAL_GPU_NAME = "B200"
 nsight_volume = modal.Volume.from_name(NSIGHT_VOLUME_NAME, create_if_missing=True)
 
@@ -47,6 +47,10 @@ image = (
         str(PROJECT_DIR / "kernel_2_tensor_core.py"),
         remote_path=f"{REMOTE_PROJECT_DIR}/kernel_2_tensor_core.py",
     )
+    .add_local_file(
+        str(PROJECT_DIR / "kernel_4_stmatrix.py"),
+        remote_path=f"{REMOTE_PROJECT_DIR}/kernel_4_stmatrix.py",
+    )
 )
 
 app = modal.App("runpod-matmul-test")
@@ -58,6 +62,8 @@ def _load_kernel_module(kernel: str):
         module_name = "kernel_1_naive"
     elif kernel_name == "kernel_2_tensor_core":
         module_name = "kernel_2_tensor_core"
+    elif kernel_name == "kernel_4_stmatrix":
+        module_name = "kernel_4_stmatrix"
     else:
         raise ValueError(
             f"Unsupported kernel '{kernel_name}'. Expected one of {KERNEL_CHOICES}."
