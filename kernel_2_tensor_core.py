@@ -29,7 +29,6 @@ THREADS_PER_CTA = 128
 AB_STAGES = 1
 WARMUP_ITERATIONS = 10
 TIMED_ITERATIONS = 100
-USE_CUDA_GRAPH_REPLAY = True
 
 
 def _ensure_cuda_bindings_driver():
@@ -366,6 +365,7 @@ def run_matmul_local(
         _ensure_cuda_bindings_driver()
         import torch
         import cutlass
+        import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
         from cuda.bindings import driver as cu_driver
         from cutlass.cute.runtime import from_dlpack
@@ -429,11 +429,18 @@ def run_matmul_local(
         .mark_compact_shape_dynamic(mode=1, divisibility=dim)
     )
 
+    # Compile once to a fixed JIT executor before warmup/timing.
     # print("[kernel_2] before launcher construction", flush=True)
-    host_function = _get_cutedsl_launcher()
+    host_function = cute.compile(
+        _get_cutedsl_launcher(),
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        current_stream,
+    )
     # print("[kernel_2] after launcher construction", flush=True)
 
-    # First launch pays the CuTeDSL JIT cost; later warmups flush lazy runtime costs.
+    # Compilation above pays the JIT cost; warmups flush lazy runtime costs.
     for _ in range(WARMUP_ITERATIONS):
         # print("[kernel_2] before warmup launch", flush=True)
         host_function(a_tensor, b_tensor, c_tensor, current_stream)
@@ -444,22 +451,6 @@ def run_matmul_local(
     timed_matmul_region = profile_region or nullcontext
     profiler_enabled = profile_region is not None
     timed_iterations = 1 if profiler_enabled else TIMED_ITERATIONS
-    use_cuda_graph_replay = USE_CUDA_GRAPH_REPLAY and not profiler_enabled
-    cuda_graph = None
-
-    if use_cuda_graph_replay:
-        # Capture exactly one already-warmed CuTeDSL launch. Timing graph.replay()
-        # avoids charging Python/CuTeDSL wrapper overhead to the kernel.
-        capture_stream = torch.cuda.Stream(device=device)
-        capture_cu_stream = cu_driver.CUstream(capture_stream.cuda_stream)
-        cuda_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(
-            cuda_graph,
-            stream=capture_stream,
-            capture_error_mode="thread_local",
-        ):
-            host_function(a_tensor, b_tensor, c_tensor, capture_cu_stream)
-        capture_stream.synchronize()
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -468,10 +459,7 @@ def run_matmul_local(
         # print("[kernel_2] before timed launch", flush=True)
         start_event.record(torch_stream)
         for _ in range(timed_iterations):
-            if cuda_graph is not None:
-                cuda_graph.replay()
-            else:
-                host_function(a_tensor, b_tensor, c_tensor, current_stream)
+            host_function(a_tensor, b_tensor, c_tensor, current_stream)
         end_event.record(torch_stream)
         # print("[kernel_2] before timed sync", flush=True)
         torch_stream.synchronize()
@@ -507,15 +495,11 @@ def run_matmul_local(
         "cta_group": 1,
         "device": torch.cuda.get_device_name(0),
         "gpu_count": torch.cuda.device_count(),
-        "timing_method": (
-            "cuda_events_graph_replay_average"
-            if use_cuda_graph_replay
-            else "cuda_events_explicit_stream_average"
-        ),
+        "timing_method": "cuda_events_explicit_stream_average",
         "profiler_enabled": profiler_enabled,
-        "cuda_graph_replay": use_cuda_graph_replay,
         "warmup_iterations": WARMUP_ITERATIONS,
         "timed_iterations": timed_iterations,
+        "aggregation": "single_total_elapsed_divided_by_timed_iterations",
         "total_elapsed_ms": round(total_elapsed_ms, 3),
         "elapsed_ms": round(elapsed_ms, 3),
         "flops": flops,
