@@ -31,6 +31,7 @@ KERNEL_CHOICES = (
     "kernel_2_tensor_core",
     "kernel_4_stmatrix",
     "kernel_5_multicast_2smmma",
+    "kernel_6_2sm_pipelining",
 )
 MODAL_GPU_NAME = "B200"
 nsight_volume = modal.Volume.from_name(NSIGHT_VOLUME_NAME, create_if_missing=True)
@@ -60,6 +61,10 @@ image = (
         str(PROJECT_DIR / "kernel_5_multicast_2smmma.py"),
         remote_path=f"{REMOTE_PROJECT_DIR}/kernel_5_multicast_2smmma.py",
     )
+    .add_local_file(
+        str(PROJECT_DIR / "kernel_6_2sm_pipelining.py"),
+        remote_path=f"{REMOTE_PROJECT_DIR}/kernel_6_2sm_pipelining.py",
+    )
 )
 
 app = modal.App("runpod-matmul-test")
@@ -75,6 +80,8 @@ def _load_kernel_module(kernel: str):
         module_name = "kernel_4_stmatrix"
     elif kernel_name == "kernel_5_multicast_2smmma":
         module_name = "kernel_5_multicast_2smmma"
+    elif kernel_name == "kernel_6_2sm_pipelining":
+        module_name = "kernel_6_2sm_pipelining"
     else:
         raise ValueError(
             f"Unsupported kernel '{kernel_name}'. Expected one of {KERNEL_CHOICES}."
