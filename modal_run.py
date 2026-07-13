@@ -32,6 +32,7 @@ KERNEL_CHOICES = (
     "kernel_4_stmatrix",
     "kernel_5_multicast_2smmma",
     "kernel_6_2sm_pipelining",
+    "kernel_7_writeout_buffer",
 )
 MODAL_GPU_NAME = "B200"
 nsight_volume = modal.Volume.from_name(NSIGHT_VOLUME_NAME, create_if_missing=True)
@@ -65,6 +66,10 @@ image = (
         str(PROJECT_DIR / "kernel_6_2sm_pipelining.py"),
         remote_path=f"{REMOTE_PROJECT_DIR}/kernel_6_2sm_pipelining.py",
     )
+    .add_local_file(
+        str(PROJECT_DIR / "kernel_7_writeout_buffer.py"),
+        remote_path=f"{REMOTE_PROJECT_DIR}/kernel_7_writeout_buffer.py",
+    )
 )
 
 app = modal.App("runpod-matmul-test")
@@ -82,6 +87,8 @@ def _load_kernel_module(kernel: str):
         module_name = "kernel_5_multicast_2smmma"
     elif kernel_name == "kernel_6_2sm_pipelining":
         module_name = "kernel_6_2sm_pipelining"
+    elif kernel_name == "kernel_7_writeout_buffer":
+        module_name = "kernel_7_writeout_buffer"
     else:
         raise ValueError(
             f"Unsupported kernel '{kernel_name}'. Expected one of {KERNEL_CHOICES}."
