@@ -34,6 +34,7 @@ KERNEL_CHOICES = (
     "kernel_6_2sm_pipelining",
     "kernel_7_writeout_buffer",
     "kernel_8_clc_persistent",
+    "kernel_9_thread_block_swizzle",
 )
 MODAL_GPU_NAME = "B200"
 nsight_volume = modal.Volume.from_name(NSIGHT_VOLUME_NAME, create_if_missing=True)
@@ -75,6 +76,10 @@ image = (
         str(PROJECT_DIR / "kernel_8_clc_persistent.py"),
         remote_path=f"{REMOTE_PROJECT_DIR}/kernel_8_clc_persistent.py",
     )
+    .add_local_file(
+        str(PROJECT_DIR / "kernel_9_thread_block_swizzle.py"),
+        remote_path=f"{REMOTE_PROJECT_DIR}/kernel_9_thread_block_swizzle.py",
+    )
 )
 
 app = modal.App("runpod-matmul-test")
@@ -96,6 +101,8 @@ def _load_kernel_module(kernel: str):
         module_name = "kernel_7_writeout_buffer"
     elif kernel_name == "kernel_8_clc_persistent":
         module_name = "kernel_8_clc_persistent"
+    elif kernel_name == "kernel_9_thread_block_swizzle":
+        module_name = "kernel_9_thread_block_swizzle"
     else:
         raise ValueError(
             f"Unsupported kernel '{kernel_name}'. Expected one of {KERNEL_CHOICES}."
