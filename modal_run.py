@@ -3,8 +3,8 @@
 Usage:
     pip install modal
     modal setup
-    modal run modal_run.py
-    modal run modal_run.py --dim 8192
+    modal run modal_run.py::main --kernel kernel_1_1_naive --dim 4096
+    modal run modal_run.py::profile --kernel kernel_1_1_naive --dim 4096
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ DEFAULT_DIM = 4096
 DEFAULT_KERNEL = "kernel_2_tensor_core"
 KERNEL_CHOICES = (
     "kernel_1_naive",
+    "kernel_1_1_naive",
     "kernel_2_tensor_core",
     "kernel_4_stmatrix",
     "kernel_5_multicast_2smmma",
@@ -52,6 +53,10 @@ image = (
     .add_local_file(
         str(PROJECT_DIR / "kernel_1_naive.py"),
         remote_path=f"{REMOTE_PROJECT_DIR}/kernel_1_naive.py",
+    )
+    .add_local_file(
+        str(PROJECT_DIR / "kernel_1_1_naive.py"),
+        remote_path=f"{REMOTE_PROJECT_DIR}/kernel_1_1_naive.py",
     )
     .add_local_file(
         str(PROJECT_DIR / "kernel_2_tensor_core.py"),
@@ -94,6 +99,8 @@ def _load_kernel_module(kernel: str):
     kernel_name = str(kernel)
     if kernel_name == "kernel_1_naive":
         module_name = "kernel_1_naive"
+    elif kernel_name == "kernel_1_1_naive":
+        module_name = "kernel_1_1_naive"
     elif kernel_name == "kernel_2_tensor_core":
         module_name = "kernel_2_tensor_core"
     elif kernel_name == "kernel_4_stmatrix":

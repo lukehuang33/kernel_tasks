@@ -64,7 +64,7 @@ EPI_STAGES = 2 # pipeline epilogue + write out
 OUTPUT_STAGE_N = 32
 TMEM_COLUMNS = 512
 ACC_STAGE_STRIDE_COLS = TMEM_COLUMNS // ACC_STAGES
-PACKED_COORD_STRIDE = 1 << 16
+PACKED_COORD_STRIDE = 1 << 16 # Let Hamiltonian path entry to be stored as one int32
 
 # Calculate thread numbers
 EPILOGUE_THREADS = EPILOGUE_WARPS * 32
@@ -83,15 +83,17 @@ DEFAULT_GPU = "B200"
 
 _CUTE_DSL_LAUNCHER: Any | None = None
 
-
+# get the primary/secondary direction for the generator
 def _direction(value: int) -> int:
     return (value > 0) - (value < 0)
 
-
+# get half direction vectors
 def _half_toward_zero(value: int) -> int:
     return value // 2 if value >= 0 else -((-value) // 2)
 
-
+# x, y -> cluster M and N coords
+# a = (ax, ay) -> primary traversal direction
+# b = (bx, by) -> secondary traversal direction
 def _gilbert_generate_2d(
     x: int,
     y: int,
@@ -106,6 +108,7 @@ def _gilbert_generate_2d(
     dax, day = _direction(ax), _direction(ay)
     dbx, dby = _direction(bx), _direction(by)
 
+    # base cases
     if height == 1:
         for _ in range(width):
             yield x, y
@@ -125,6 +128,7 @@ def _gilbert_generate_2d(
     width2 = abs(ax2 + ay2)
     height2 = abs(bx2 + by2)
 
+    # if region is elongated, split it into two along the longer direction
     if 2 * width > 3 * height:
         if width2 % 2 == 1 and width > 2:
             ax2 += dax
@@ -140,6 +144,7 @@ def _gilbert_generate_2d(
         )
         return
 
+    # if region is square-like, split it into 3 separate regions in a U-shape
     if height2 % 2 == 1 and height > 2:
         bx2 += dbx
         by2 += dby

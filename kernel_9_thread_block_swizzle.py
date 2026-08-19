@@ -312,6 +312,8 @@ def _get_cutedsl_launcher():
         cta_n_in_cluster = block_n % CLUSTER_SHAPE_MN[1]
         cluster_dim_m = grid_dim[0] // CLUSTER_SHAPE_MN[0]
         cluster_dim_n = grid_dim[1] // CLUSTER_SHAPE_MN[1]
+
+        # initialize thread block level swizzle
         swizzle_m_size = cluster_dim_m // BLOCK_SWIZZLE_SIZE
         swizzle_n_size = cluster_dim_n // BLOCK_SWIZZLE_SIZE
         swizzle_m_bound = swizzle_m_size * BLOCK_SWIZZLE_SIZE
