@@ -30,6 +30,7 @@ KERNEL_CHOICES = (
     "kernel_1_naive",
     "kernel_1_1_naive",
     "kernel_2_tensor_core",
+    "kernel_3_swizzling",
     "kernel_4_stmatrix",
     "kernel_5_multicast_2smmma",
     "kernel_6_2sm_pipelining",
@@ -61,6 +62,10 @@ image = (
     .add_local_file(
         str(PROJECT_DIR / "kernel_2_tensor_core.py"),
         remote_path=f"{REMOTE_PROJECT_DIR}/kernel_2_tensor_core.py",
+    )
+    .add_local_file(
+        str(PROJECT_DIR / "kernel_3_swizzling.py"),
+        remote_path=f"{REMOTE_PROJECT_DIR}/kernel_3_swizzling.py",
     )
     .add_local_file(
         str(PROJECT_DIR / "kernel_4_stmatrix.py"),
@@ -103,6 +108,8 @@ def _load_kernel_module(kernel: str):
         module_name = "kernel_1_1_naive"
     elif kernel_name == "kernel_2_tensor_core":
         module_name = "kernel_2_tensor_core"
+    elif kernel_name == "kernel_3_swizzling":
+        module_name = "kernel_3_swizzling"
     elif kernel_name == "kernel_4_stmatrix":
         module_name = "kernel_4_stmatrix"
     elif kernel_name == "kernel_5_multicast_2smmma":

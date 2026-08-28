@@ -1,7 +1,7 @@
-"""Blackwell Tensor Core GEMM implemented with CuTeDSL.
+"""Blackwell Tensor Core GEMM without shared-memory swizzling in CuTeDSL.
 
-This module adapts NVIDIA's official Blackwell CuTeDSL tutorial GEMM to match
-the structure of the Mojo kernel provided by the user:
+This module mirrors the structure of Modular's iterative Blackwell matmul
+kernel 2 while retaining the existing CuTeDSL runtime and benchmark harness:
 
 - BF16 inputs
 - FP32 accumulation in tensor memory
@@ -9,6 +9,7 @@ the structure of the Mojo kernel provided by the user:
 - CTA-group-one tcgen05 MMA
 - block tile shape 64 x 256 x 64
 - B stored in transposed form (N x K)
+- unswizzled K-major shared-memory layouts for A and B
 """
 
 from contextlib import nullcontext
@@ -301,19 +302,34 @@ def _get_cutedsl_launcher():
         )
         tiled_mma = cute.make_tiled_mma(op)
 
-        # create layout for a
-        a_smem_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            mma_tiler_mnk,
-            a.element_type,
-            AB_STAGES,
+        # Build the K-major operand layouts explicitly instead of using the
+        # Blackwell helper's swizzle-selection heuristic. For BF16 and K=64,
+        # that helper selects K_SW128; Modular kernel 2 instead uses
+        # SWIZZLE_NONE. CuTeDSL represents the corresponding canonical
+        # 16-byte-interleaved, descriptor-unswizzled layout with K_INTER.
+        a_smem_shape = tiled_mma.partition_shape_A(
+            cute.dice(mma_tiler_mnk, (1, None, 1))
         )
-        # create layout for b
-        b_smem_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            mma_tiler_mnk,
+        b_smem_shape = tiled_mma.partition_shape_B(
+            cute.dice(mma_tiler_mnk, (None, 1, 1))
+        )
+        a_smem_layout_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_INTER,
+            a.element_type,
+        )
+        b_smem_layout_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_INTER,
             b.element_type,
-            AB_STAGES,
+        )
+        a_smem_layout = tcgen05.tile_to_mma_shape(
+            a_smem_layout_atom,
+            cute.append(a_smem_shape, AB_STAGES),
+            order=(1, 2, 3),
+        )
+        b_smem_layout = tcgen05.tile_to_mma_shape(
+            b_smem_layout_atom,
+            cute.append(b_smem_shape, AB_STAGES),
+            order=(1, 2, 3),
         )
         a_smem_layout_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
         b_smem_layout_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
@@ -480,7 +496,7 @@ def run_matmul_local(
     return {
         "status": "success",
         "kernel": "kernel_2_tensor_core",
-        "implementation": "cutedsl_blackwell_tcgen05",
+        "implementation": "cutedsl_blackwell_tcgen05_no_smem_swizzle",
         "operation": "cute.gemm",
         "shape_a": list(a.shape),
         "shape_b": list(b.shape),
@@ -493,6 +509,7 @@ def run_matmul_local(
         "mma_shape": [TILE_M, TILE_N, 16],
         "threads_per_cta": THREADS_PER_CTA,
         "cta_group": 1,
+        "smem_swizzle": "none",
         "device": torch.cuda.get_device_name(0),
         "gpu_count": torch.cuda.device_count(),
         "timing_method": "cuda_events_explicit_stream_average",

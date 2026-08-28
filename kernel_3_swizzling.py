@@ -1,7 +1,8 @@
-"""Blackwell Tensor Core GEMM with stmatrix packing and TMA stores.
+"""Blackwell Tensor Core GEMM with shared-memory swizzling in CuTeDSL.
 
-Keeps the same CuTeDSL mainloop as kernel_3_swizzling and modifies
-the epilogue to match Modular's kernel 4 structure:
+This module preserves the original CuTeDSL implementation and corresponds to
+the Modular iterative matmul kernel 3, which adds 128-byte TMA/shared-memory
+swizzling to the tensor-core kernel:
 
 - BF16 inputs
 - FP32 accumulation in tensor memory
@@ -9,7 +10,7 @@ the epilogue to match Modular's kernel 4 structure:
 - CTA-group-one tcgen05 MMA
 - block tile shape 64 x 256 x 64
 - B stored in transposed form (N x K)
-- stmatrix packs BF16 output in shared memory before TMA store
+- 128-byte shared-memory swizzling for A and B
 """
 
 from contextlib import nullcontext
@@ -28,7 +29,6 @@ TILE_N = 256
 TILE_K = 64
 THREADS_PER_CTA = 128
 AB_STAGES = 1
-EPI_STAGES = 1
 WARMUP_ITERATIONS = 10
 TIMED_ITERATIONS = 100
 
@@ -41,7 +41,7 @@ def _ensure_cuda_bindings_driver():
             from cuda import cuda as legacy_cuda_driver  # type: ignore
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "kernel_4_stmatrix requires the CuTeDSL runtime, including "
+                "kernel_3_swizzling requires the CuTeDSL runtime, including "
                 "nvidia-cutlass-dsl and CUDA Python bindings."
             ) from exc
 
@@ -85,13 +85,9 @@ def _get_cutedsl_launcher():
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
-        tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
-        c_smem_layout_kind: cutlass.Constexpr,
-        epi_smem_layout: cute.ComposedLayout,
-        epi_tile: cute.Tile,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -112,12 +108,6 @@ def _get_cutedsl_launcher():
             byte_alignment=128,
             swizzle=b_smem_layout.inner,
         )
-        sC = smem.allocate_tensor( # kernel 4: set smem layout for C
-            element_type=io_dtype,
-            layout=epi_smem_layout.outer,
-            byte_alignment=128,
-            swizzle=epi_smem_layout.inner,
-        )
 
         tmem_alloc_barrier = pipeline.NamedBarrier( # create tmem barrier for allocator
             barrier_id=1,
@@ -129,20 +119,10 @@ def _get_cutedsl_launcher():
         )
         tmem.allocate(512) # tensor memory allocator
 
-        epilogue_pipeline_producer_group = pipeline.CooperativeGroup( # move from smem to gmem
-            pipeline.Agent.Thread,
-            size=THREADS_PER_CTA,
-        )
-        epilogue_pipeline = pipeline.PipelineTmaStore.create(
-            num_stages=EPI_STAGES,
-            producer_group=epilogue_pipeline_producer_group,
-        )
-
         if warp_idx == 0:
             # get descriptors for A and B matrices
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            cpasync.prefetch_descriptor(tma_atom_c)
 
         num_tma_copy_bytes = cute.size_in_bytes(
             io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
@@ -195,18 +175,23 @@ def _get_cutedsl_launcher():
         tmem_ptr = tmem.retrieve_ptr(acc_dtype)
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
+        cta_tile_shape_mnk = (
+            mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id),
+            mma_tiler_mnk[1],
+            mma_tiler_mnk[2],
+        )
+        
         # get tile shape for epilogue load out of tmem and into shared mem
+        epi_tile = sm100_utils.compute_epilogue_tile_shape(
+            cta_tile_shape_mnk,
+            False,
+            utils.LayoutEnum.from_tensor(mC_mnl),
+            io_dtype,
+        )
         tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
         tCtAcc_epi = cute.flat_divide(
             tCtAcc[((None, None), 0, 0)],
             epi_tile,
-        )
-        tCsC, tCgC_tma = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sC, 0, 2),
-            cute.group_modes(tCgC_epi, 0, 2),
         )
 
         # define shape for tmem to registers
@@ -228,20 +213,7 @@ def _get_cutedsl_launcher():
             tTR_gC[(None, None, None, 0, 0)].shape, cutlass.Float32
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-
-        # pack output in shared memory with stmatrix before TMA store
-        copy_atom_r2s = sm100_utils.get_smem_store_op(
-            c_smem_layout_kind,
-            io_dtype,
-            acc_dtype,
-            tiled_copy_t2r,
-        )
-        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-        tRS_sC = thr_copy_r2s.partition_D(sC)
-        tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
-        tRS_rC = cute.make_rmem_tensor(tRS_rAcc.shape, io_dtype)
-        tCgC_grouped = cute.group_modes(tCgC_tma, 1, cute.rank(tCgC_tma))
+        tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
 
         num_k_tiles = cute.size(gA, mode=[2])
         tma_phase = cutlass.Int32(0)
@@ -298,34 +270,17 @@ def _get_cutedsl_launcher():
             cute.arch.mbarrier_wait(mma_mbar_ptr, mma_phase)
             mma_phase ^= 1
 
+        # release lock so hardware allocator could make progress
+        tmem.relinquish_alloc_permit()
+
         # epilogue + tensor mem cleanup
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         for subtile_idx in cutlass.range(subtile_cnt):
             tTR_tAcc_slice = tTR_tAcc[(None, None, None, subtile_idx)]
+            tTR_gC_slice = tTR_gC[(None, None, None, subtile_idx)]
             cute.copy(tiled_copy_t2r, tTR_tAcc_slice, tTR_rAcc)
+            tTR_gC_slice.store(tTR_rAcc.load().to(io_dtype))
 
-            c_buffer = subtile_idx % EPI_STAGES
-            tRS_sC_slice = tRS_sC[(None, None, None, c_buffer)]
-
-            tRS_rC.store(tRS_rAcc.load().to(io_dtype)) # convert fp32 accumulator values to bf16 in trs_rc
-            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC_slice)
-
-            cute.arch.fence_view_async_shared() # make sure that tma can see the smem writes
-            cute.arch.sync_threads()
-
-            if issue_warp:
-                cute.copy(
-                    tma_atom_c,
-                    tCsC[(None, c_buffer)],
-                    tCgC_grouped[(None, subtile_idx)],
-                )
-                epilogue_pipeline.producer_commit()
-                epilogue_pipeline.producer_acquire()
-            cute.arch.sync_threads()
-
-        epilogue_pipeline.producer_tail()
-        # release lock so hardware allocator could make progress
-        tmem.relinquish_alloc_permit()
         pipeline.sync(barrier_id=1)
         tmem.free(tmem_ptr)
 
@@ -348,14 +303,15 @@ def _get_cutedsl_launcher():
         )
         tiled_mma = cute.make_tiled_mma(op)
 
-        # create layout for a
+        # Create the swizzled layout for A. The Blackwell helper selects the
+        # widest compatible layout atom; BF16 with K=64 selects K_SW128.
         a_smem_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
             mma_tiler_mnk,
             a.element_type,
             AB_STAGES,
         )
-        # create layout for b
+        # Create the matching K_SW128 layout for transposed B.
         b_smem_layout = sm100_utils.make_smem_layout_b(
             tiled_mma,
             mma_tiler_mnk,
@@ -382,33 +338,6 @@ def _get_cutedsl_launcher():
             tiled_mma,
         )
 
-        # add epilogue layouts for c 
-        c_smem_layout_kind = utils.LayoutEnum.from_tensor(c)
-        cta_tile_shape_mnk = (
-            mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id),
-            mma_tiler_mnk[1],
-            mma_tiler_mnk[2],
-        )
-        epi_tile = sm100_utils.compute_epilogue_tile_shape(
-            cta_tile_shape_mnk,
-            False,
-            c_smem_layout_kind,
-            io_dtype,
-        )
-        epi_smem_layout = sm100_utils.make_smem_layout_epi(
-            io_dtype,
-            c_smem_layout_kind,
-            epi_tile,
-            EPI_STAGES,
-        )
-        epi_smem_layout_one_stage = cute.slice_(epi_smem_layout, (None, None, 0))
-        c_tma_atom, c_tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom( # add output tma atom for bf16 output
-            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
-            c,
-            epi_smem_layout_one_stage,
-            epi_tile,
-        )
-
         # define grid shape and call kernel
         grid_shape = cute.ceil_div((*c.layout.shape, 1), mma_tiler_mnk[:2])
         kernel(
@@ -417,13 +346,9 @@ def _get_cutedsl_launcher():
             a_tma_tensor,
             b_tma_atom,
             b_tma_tensor,
-            c_tma_atom,
-            c_tma_tensor,
+            c,
             a_smem_layout,
             b_smem_layout,
-            c_smem_layout_kind,
-            epi_smem_layout,
-            epi_tile,
         ).launch(
             grid=grid_shape,
             block=(THREADS_PER_CTA, 1, 1),
@@ -449,7 +374,7 @@ def run_matmul_local(
         from cutlass.cute.runtime import from_dlpack
     except (ModuleNotFoundError, RuntimeError) as exc:
         raise RuntimeError(
-            "kernel_4_stmatrix requires the CuTeDSL runtime, including "
+            "kernel_3_swizzling requires the CuTeDSL runtime, including "
             "nvidia-cutlass-dsl and CUDA Python bindings."
         ) from exc
 
@@ -458,13 +383,13 @@ def run_matmul_local(
     if requested_dtype_name not in (DEFAULT_DTYPE, "float16", "float32"):
         raise ValueError(
             f"Unsupported dtype '{requested_dtype_name}'. "
-            f"kernel_4_stmatrix only supports {DEFAULT_DTYPE} inputs."
+            f"kernel_3_swizzling only supports {DEFAULT_DTYPE} inputs."
         )
 
     if dim % TILE_M != 0 or dim % TILE_N != 0 or dim % TILE_K != 0:
         raise ValueError(
             f"dim={dim} must be divisible by ({TILE_M}, {TILE_N}, {TILE_K}) "
-            "for kernel_4_stmatrix."
+            "for kernel_3_swizzling."
         )
 
     if not torch.cuda.is_available():
@@ -473,7 +398,7 @@ def run_matmul_local(
     cu_driver.cuInit(0)
     err, device_count = cu_driver.cuDeviceGetCount()
     if err != cu_driver.CUresult.CUDA_SUCCESS or device_count < 1:
-        raise RuntimeError("A GPU is required to run kernel_4_stmatrix.")
+        raise RuntimeError("A GPU is required to run kernel_3_swizzling.")
 
     device = torch.device("cuda")
     torch_stream = torch.cuda.current_stream(device)
@@ -508,7 +433,7 @@ def run_matmul_local(
     )
 
     # Compile once to a fixed JIT executor before warmup/timing.
-    # print("[kernel_4] before launcher construction", flush=True)
+    # print("[kernel_3] before launcher construction", flush=True)
     host_function = cute.compile(
         _get_cutedsl_launcher(),
         a_tensor,
@@ -516,15 +441,15 @@ def run_matmul_local(
         c_tensor,
         current_stream,
     )
-    # print("[kernel_4] after launcher construction", flush=True)
+    # print("[kernel_3] after launcher construction", flush=True)
 
     # Compilation above pays the JIT cost; warmups flush lazy runtime costs.
     for _ in range(WARMUP_ITERATIONS):
-        # print("[kernel_4] before warmup launch", flush=True)
+        # print("[kernel_3] before warmup launch", flush=True)
         host_function(a_tensor, b_tensor, c_tensor, current_stream)
-    # print("[kernel_4] before warmup sync", flush=True)
+    # print("[kernel_3] before warmup sync", flush=True)
     torch_stream.synchronize()
-    # print("[kernel_4] after warmup sync", flush=True)
+    # print("[kernel_3] after warmup sync", flush=True)
 
     timed_matmul_region = profile_region or nullcontext
     profiler_enabled = profile_region is not None
@@ -534,31 +459,31 @@ def run_matmul_local(
     end_event = torch.cuda.Event(enable_timing=True)
 
     with timed_matmul_region():
-        # print("[kernel_4] before timed launch", flush=True)
+        # print("[kernel_3] before timed launch", flush=True)
         start_event.record(torch_stream)
         for _ in range(timed_iterations):
             host_function(a_tensor, b_tensor, c_tensor, current_stream)
         end_event.record(torch_stream)
-        # print("[kernel_4] before timed sync", flush=True)
+        # print("[kernel_3] before timed sync", flush=True)
         torch_stream.synchronize()
-        # print("[kernel_4] after timed sync", flush=True)
+        # print("[kernel_3] after timed sync", flush=True)
 
-    # print("[kernel_4] before elapsed time read", flush=True)
+    # print("[kernel_3] before elapsed time read", flush=True)
     total_elapsed_ms = start_event.elapsed_time(end_event)
     elapsed_ms = total_elapsed_ms / timed_iterations
     elapsed_s = elapsed_ms / 1000.0
     flops = 2 * dim * dim * dim
     tflops = flops / elapsed_s / 1e12 if elapsed_s > 0 else 0.0
 
-    # print("[kernel_4] before checksum", flush=True)
+    # print("[kernel_3] before checksum", flush=True)
     result_checksum = float(c.float().sum().item())
-    # print("[kernel_4] after checksum", flush=True)
+    # print("[kernel_3] after checksum", flush=True)
 
-    # print("[kernel_4] returning result", flush=True)
+    # print("[kernel_3] returning result", flush=True)
     return {
         "status": "success",
-        "kernel": "kernel_4_stmatrix",
-        "implementation": "cutedsl_blackwell_tcgen05_stmatrix_tma_store",
+        "kernel": "kernel_3_swizzling",
+        "implementation": "cutedsl_blackwell_tcgen05_smem_swizzle_128b",
         "operation": "cute.gemm",
         "shape_a": list(a.shape),
         "shape_b": list(b.shape),
@@ -571,7 +496,7 @@ def run_matmul_local(
         "mma_shape": [TILE_M, TILE_N, 16],
         "threads_per_cta": THREADS_PER_CTA,
         "cta_group": 1,
-        "epilogue": "stmatrix_to_smem_tma_store",
+        "smem_swizzle": "128B",
         "device": torch.cuda.get_device_name(0),
         "gpu_count": torch.cuda.device_count(),
         "timing_method": "cuda_events_explicit_stream_average",
