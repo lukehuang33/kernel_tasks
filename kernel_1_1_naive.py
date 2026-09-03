@@ -1,15 +1,3 @@
-"""Naive matrix multiplication implemented directly in CuTeDSL.
-
-Each GPU thread owns one output element and computes it with a scalar loop over
-the full reduction dimension::
-
-    C[row, column] = sum(A[row, k] * B[k, column] for k in range(K))
-
-This kernel intentionally does not use ``cute.gemm``, tensor cores, shared
-memory tiling, or asynchronous copies.  It is a simple CuTeDSL baseline with
-BF16 inputs/output and FP32 accumulation.
-"""
-
 from __future__ import annotations
 
 from contextlib import nullcontext

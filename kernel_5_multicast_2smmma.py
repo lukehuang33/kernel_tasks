@@ -1,7 +1,7 @@
 """Blackwell Tensor Core GEMM with TMA multicast and 2-SM MMA.
 
-Starts from kernel_4_stmatrix and adds only the optimizations described for
-Modular's kernel 5:
+Starts from kernel_4_stmatrix and adds the optimizations described in
+Modular's kernel 5, written in CuTeDSL:
 
 - BF16 inputs
 - FP32 accumulation in tensor memory
@@ -29,7 +29,7 @@ DTYPE_CHOICES = ("bfloat16",)
 ACCUMULATION_DTYPE = "float32"
 OUTPUT_DTYPE = "bfloat16"
 
-# Modular's kernel 5 gives each CTA a 128 x 128 x 64 A/B SMEM tile. The two
+# Basing off of Modular's kernel 5, each CTA owns a 128 x 128 x 64 A/B SMEM tile. The two
 # CTAs in a pair jointly issue a 256 x 256 x 16 MMA instruction, and each CTA
 # owns a 128 x 256 slice of the output.
 SMEM_TILE_M = 128
@@ -46,8 +46,7 @@ CLUSTER_SHAPE_MN = (2, 1)
 AB_STAGES = 1
 ACC_STAGES = 1
 EPI_STAGES = 1
-# Match Modular's kernel-5 benchmark: warm up with 20 ordinary launches, then
-# time 50 ordinary launches as one aggregate and divide by the run count.
+
 WARMUP_ITERATIONS = 20
 TIMED_ITERATIONS = 50
 
@@ -622,10 +621,7 @@ def run_matmul_local(
         .mark_compact_shape_dynamic(mode=1, divisibility=dim)
     )
 
-    # Compile once to a fixed JIT executor before warmup/timing. Calling the
-    # decorated @cute.jit function directly would repeatedly enter CuTeDSL's
-    # implicit dispatch path, unlike Mojo's already-compiled benchmark closure.
-    # print("[kernel_5] before launcher construction", flush=True)
+    # Compile once to a fixed JIT executor before warmup/timing.
     host_function = cute.compile(
         _get_cutedsl_launcher(),
         a_tensor,
@@ -633,15 +629,11 @@ def run_matmul_local(
         c_tensor,
         current_stream,
     )
-    # print("[kernel_5] after launcher construction", flush=True)
 
     # Compilation above pays the JIT cost; warmups flush lazy runtime costs.
     for _ in range(WARMUP_ITERATIONS):
-        # print("[kernel_5] before warmup launch", flush=True)
         host_function(a_tensor, b_tensor, c_tensor, current_stream)
-    # print("[kernel_5] before warmup sync", flush=True)
     torch_stream.synchronize()
-    # print("[kernel_5] after warmup sync", flush=True)
 
     timed_matmul_region = profile_region or nullcontext
     profiler_enabled = profile_region is not None
@@ -651,16 +643,12 @@ def run_matmul_local(
     end_event = torch.cuda.Event(enable_timing=True)
 
     with timed_matmul_region():
-        # print("[kernel_5] before timed launch", flush=True)
         start_event.record(torch_stream)
         for _ in range(timed_iterations):
             host_function(a_tensor, b_tensor, c_tensor, current_stream)
         end_event.record(torch_stream)
-        # print("[kernel_5] before timed sync", flush=True)
         torch_stream.synchronize()
-        # print("[kernel_5] after timed sync", flush=True)
 
-    # print("[kernel_5] before elapsed time read", flush=True)
     total_elapsed_ms = start_event.elapsed_time(end_event)
     elapsed_ms = total_elapsed_ms / timed_iterations
     elapsed_s = elapsed_ms / 1000.0
@@ -675,11 +663,8 @@ def run_matmul_local(
     torch.testing.assert_close(c, reference, atol=1e-2, rtol=1e-2)
     max_abs_error = float((c.float() - reference.float()).abs().max().item())
 
-    # print("[kernel_5] before checksum", flush=True)
     result_checksum = float(c.float().sum().item())
-    # print("[kernel_5] after checksum", flush=True)
 
-    # print("[kernel_5] returning result", flush=True)
     return {
         "status": "success",
         "kernel": "kernel_5_multicast_2smmma",

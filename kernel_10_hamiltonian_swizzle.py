@@ -3,10 +3,10 @@
 Blackwell Tensor Core GEMM with a Hamiltonian CLC tile traversal.
 
 This experimental kernel extends kernel_8_clc_persistent.py with a generalized Hilbert
-(Gilbert) traversal of the cluster-tile grid. The host constructs a compact rectangular
+(Gilbert) traversal of the cluster tile grid. The host constructs a compact rectangular
 Hamiltonian path, packs each cluster coordinate into one int32, and uploads the mapping
 to the GPU. Raw CLC coordinates index that mapping, so consecutive scheduler positions
-are spatially adjacent rather than being restricted to kernel 9's two-column swizzle.
+are spatially adjacent rather than being restricted to kernel 9's two column swizzle.
 
 The CTA group still uses two CTAs, TMA for A/B loads, tcgen05 MMA, and a double-buffered
 writeout path for C. Apart from work-coordinate mapping, the implementation keeps kernel
@@ -64,7 +64,9 @@ EPI_STAGES = 2 # pipeline epilogue + write out
 OUTPUT_STAGE_N = 32
 TMEM_COLUMNS = 512
 ACC_STAGE_STRIDE_COLS = TMEM_COLUMNS // ACC_STAGES
-PACKED_COORD_STRIDE = 1 << 16 # Let Hamiltonian path entry to be stored as one int32
+# Reserve the low 16 bits for cluster N so one int32 table load recovers both
+# coordinates: packed = cluster_m * stride + cluster_n.
+PACKED_COORD_STRIDE = 1 << 16
 
 # Calculate thread numbers
 EPILOGUE_THREADS = EPILOGUE_WARPS * 32
@@ -83,17 +85,17 @@ DEFAULT_GPU = "B200"
 
 _CUTE_DSL_LAUNCHER: Any | None = None
 
-# get the primary/secondary direction for the generator
+# return -1, 0, or 1 so the path can move one grid cell in value's direction
 def _direction(value: int) -> int:
     return (value > 0) - (value < 0)
 
-# get half direction vectors
+# Divide integer by 0 and round towards 0 for both positive and negative values.
+# This is done to split forward and reverse direciton vectors symmetrically.
 def _half_toward_zero(value: int) -> int:
     return value // 2 if value >= 0 else -((-value) // 2)
 
-# x, y -> cluster M and N coords
-# a = (ax, ay) -> primary traversal direction
-# b = (bx, by) -> secondary traversal direction
+# (x, y) is the entry cluster. Vectors a=(ax, ay) and b=(bx, by) describe the
+# oriented primary and secondary sides of the remaining rectangle.
 def _gilbert_generate_2d(
     x: int,
     y: int,
@@ -108,7 +110,7 @@ def _gilbert_generate_2d(
     dax, day = _direction(ax), _direction(ay)
     dbx, dby = _direction(bx), _direction(by)
 
-    # base cases
+    # base case for Hilbert path recursion
     if height == 1:
         for _ in range(width):
             yield x, y
@@ -128,7 +130,7 @@ def _gilbert_generate_2d(
     width2 = abs(ax2 + ay2)
     height2 = abs(bx2 + by2)
 
-    # if region is elongated, split it into two along the longer direction
+    # an elongated rectangle is split into 2 along its longer side
     if 2 * width > 3 * height:
         if width2 % 2 == 1 and width > 2:
             ax2 += dax
@@ -144,10 +146,14 @@ def _gilbert_generate_2d(
         )
         return
 
-    # if region is square-like, split it into 3 separate regions in a U-shape
+    # A square-like rectangle is split into three subpaths arranged in a U. In addition,
+    # adjust the half-span parity so consecutive subpath endpoints touch.
     if height2 % 2 == 1 and height > 2:
         bx2 += dbx
         by2 += dby
+
+    # Traverse the first short side, cross the full middle strip, then reverse
+    # both axes through the final strip to return along the other short side.
     yield from _gilbert_generate_2d(x, y, bx2, by2, ax2, ay2)
     yield from _gilbert_generate_2d(
         x + bx2,
@@ -174,6 +180,9 @@ def make_hamiltonian_cluster_order(
     """Return a compact, Manhattan-adjacent path over the cluster grid."""
     if cluster_dim_m <= 0 or cluster_dim_n <= 0:
         raise ValueError("cluster dimensions must be positive")
+
+    # Use the longer grid dimension as the primary vector. This keeps the
+    # recursion's elongated-rectangle case effective regardless of grid aspect.
     if cluster_dim_m >= cluster_dim_n:
         order = list(
             _gilbert_generate_2d(
@@ -197,6 +206,7 @@ def make_hamiltonian_cluster_order(
             )
         )
 
+    # fail on the host rather than uploading a wrong schedule
     expected = cluster_dim_m * cluster_dim_n
     if len(order) != expected or len(set(order)) != expected:
         raise RuntimeError("Hamiltonian scheduler generated duplicate or missing tiles")
@@ -400,7 +410,7 @@ def _get_cutedsl_launcher():
         )
         acc_producer, acc_consumer = acc_pipeline.make_participants()
 
-        # Make the pipeline for the CLC fetches to send next work tile info to warps. 
+        # Make the pipeline for the CLC fetches to send next work tile info to warps
         clc_pipeline = pipeline.PipelineClcFetchAsync.create(
             num_stages=CLC_STAGES,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -418,7 +428,7 @@ def _get_cutedsl_launcher():
             pipeline.PipelineUserType.Consumer, CLC_STAGES
         )
 
-        # Make the pipeline for the CLC throttle. 
+        # Make the pipeline for the CLC throttle
         clc_throttle_pipeline = pipeline.PipelineAsync.create(
             num_stages=CLC_STAGES,
             producer_group=pipeline.CooperativeGroup(
@@ -473,7 +483,9 @@ def _get_cutedsl_launcher():
 
 
         if warp_idx == TMA_WARP_ID:
-            # The raw CLC cluster ID indexes the compact Hamiltonian path.
+            # Treat the raw CLC cluster's M-fastest linear ID as a position along
+            # the Hamiltonian path. One table load replaces that position with
+            # the logical cluster coordinate whose operand tiles TMA must fetch.
             tma_cluster_m = block_m // CLUSTER_SHAPE_MN[0]
             tma_cluster_n = block_n // CLUSTER_SHAPE_MN[1]
             tma_cluster_id = tma_cluster_n * cluster_dim_m + tma_cluster_m
@@ -481,7 +493,8 @@ def _get_cutedsl_launcher():
             tma_mapped_cluster_m = tma_packed_coord // PACKED_COORD_STRIDE
             tma_mapped_cluster_n = tma_packed_coord % PACKED_COORD_STRIDE
 
-            # Get the work coordinates of the cta
+            # Reattach the CTA's offset only after mapping the cluster, keeping
+            # both members of the two-CTA MMA assigned to the same work tile.
             tma_work_m = (
                 tma_mapped_cluster_m * CLUSTER_SHAPE_MN[0] + cta_m_in_cluster
             )
@@ -590,7 +603,8 @@ def _get_cutedsl_launcher():
             ab_producer.tail()
 
         if warp_idx == SCHEDULER_WARP_ID and is_first_cta_in_cluster:
-            # get index of scheduler warp
+            # The scheduler uses the same lookup as TMA, MMA, and epilogue so
+            # their independent views of CLC progress refer to one logical tile.
             scheduler_cluster_m = block_m // CLUSTER_SHAPE_MN[0]
             scheduler_cluster_n = block_n // CLUSTER_SHAPE_MN[1]
             scheduler_cluster_id = (
@@ -637,6 +651,8 @@ def _get_cutedsl_launcher():
                     "async.shared",
                     space="cta",
                 )
+                # The terminal response has no valid coordinate. Redirect it to
+                # table entry zero before the unconditional device-memory load.
                 scheduler_next_m = cutlass.Int32(
                     cutlass.select_(cutlass.Boolean(next_valid), next_m, 0)
                 )
@@ -674,7 +690,8 @@ def _get_cutedsl_launcher():
             clc_pipeline.producer_tail(clc_producer_state)
 
         if warp_idx == MMA_WARP_ID:
-            # Map the initial raw cluster coordinate to Hamiltonian order.
+            # Map the initial raw cluster coordinate to the tile whose operands
+            # and accumulator stage this warp will consume.
             mma_cluster_m = block_m // CLUSTER_SHAPE_MN[0]
             mma_cluster_n = block_n // CLUSTER_SHAPE_MN[1]
             mma_cluster_id = mma_cluster_n * cluster_dim_m + mma_cluster_m
@@ -689,7 +706,7 @@ def _get_cutedsl_launcher():
             )
             mma_work_valid = cutlass.Boolean(True)
             while mma_work_valid:
-                # Decode the next CLC response and apply the scheduler swizzle
+                # Decode the next raw CLC response before its Hamiltonian lookup.
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 next_m, next_n, _, next_valid = cute.arch.clc_response(
                     clc_response_base + clc_consumer_state.index
@@ -927,6 +944,8 @@ def _get_cutedsl_launcher():
 
                 # Assign next C tile for epilogue
 
+                # Use entry zero as a safe speculative lookup for the terminal
+                # response; epi_work_valid suppresses another epilogue iteration.
                 epi_next_m = cutlass.Int32(
                     cutlass.select_(cutlass.Boolean(next_valid), next_m, 0)
                 )
@@ -1138,12 +1157,16 @@ def run_matmul_local(
     b = make_tensor(dim, dim)
     c = torch.zeros((dim, dim), dtype=torch.bfloat16, device=device)
 
+    # A cluster spans the two CTAs that jointly cover MMA_TILE_M rows, but only
+    # one CTA_TILE_N wide tile along N. Generate one path entry per cluster.
     cluster_dim_m = dim // MMA_TILE_M
     cluster_dim_n = dim // CTA_TILE_N
     hamiltonian_order = make_hamiltonian_cluster_order(
         cluster_dim_m,
         cluster_dim_n,
     )
+    # Index is the raw M fastest scheduler position; value is the packed cluster
+    # reached at that position along the Hamiltonian path.
     packed_tile_order = torch.tensor(
         [
             cluster_m * PACKED_COORD_STRIDE + cluster_n
@@ -1168,6 +1191,8 @@ def run_matmul_local(
         .mark_layout_dynamic(leading_dim=1)
         .mark_compact_shape_dynamic(mode=1, divisibility=dim)
     )
+    # Keep the packed order on device. Every warp needs only one int32 lookup to
+    # turn a raw scheduler position into a logical cluster.
     tile_order_tensor = from_dlpack(packed_tile_order, assumed_align=16)
 
     compile_start = time.perf_counter()

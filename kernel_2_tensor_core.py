@@ -1,8 +1,4 @@
 """Blackwell Tensor Core GEMM without shared-memory swizzling in CuTeDSL.
-
-This module mirrors the structure of Modular's iterative Blackwell matmul
-kernel 2 while retaining the existing CuTeDSL runtime and benchmark harness:
-
 - BF16 inputs
 - FP32 accumulation in tensor memory
 - BF16 outputs
@@ -303,10 +299,7 @@ def _get_cutedsl_launcher():
         tiled_mma = cute.make_tiled_mma(op)
 
         # Build the K-major operand layouts explicitly instead of using the
-        # Blackwell helper's swizzle-selection heuristic. For BF16 and K=64,
-        # that helper selects K_SW128; Modular kernel 2 instead uses
-        # SWIZZLE_NONE. CuTeDSL represents the corresponding canonical
-        # 16-byte-interleaved, descriptor-unswizzled layout with K_INTER.
+        # Blackwell helper's swizzle-selection heuristic.
         a_smem_shape = tiled_mma.partition_shape_A(
             cute.dice(mma_tiler_mnk, (1, None, 1))
         )

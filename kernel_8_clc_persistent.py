@@ -2,16 +2,15 @@
 """
 Blackwell Tensor Core GEMM with CLC persistent scheduling and a TMEM accumulator ring.
 
-This kernel extends kernel_7_writeout_buffer.py by following the kernel 8 changes from
-Modular's Blackwell matmul series:
+This kernel extends kernel_7_writeout_buffer.py and follows the kernel 8 changes from
+Modular's Blackwell matmul repo:
 - persistent work assignment through the hardware CLC scheduler,
 - a dedicated scheduler warp,
 - two-stage CLC response buffering,
 - four accumulator stages in TMEM.
 
 The CTA group still uses two CTAs, TMA for A/B loads, tcgen05 MMA, and a double-buffered
-writeout path for C.  The implementation intentionally keeps the structure close to the
-Mojo reference kernel and avoids layering on extra scheduling or epilogue optimizations.
+writeout path for C.
 """
 
 import argparse

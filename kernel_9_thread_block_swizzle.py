@@ -3,7 +3,7 @@
 Blackwell Tensor Core GEMM with CLC persistence and thread-block swizzling.
 
 This kernel extends kernel_8_clc_persistent.py with the kernel 9 thread-block swizzle
-from Modular's Blackwell matmul series.  CLC coordinates are remapped in groups of two
+detailed by Modular's Blackwell matmul series.  CLC coordinates are remapped in groups of two
 N tiles before advancing along M, with alternating groups traversed in opposite
 directions.  This is a bijective permutation of the cluster-tile grid that increases
 operand reuse between work tiles assigned to the same CLC wave.
@@ -313,7 +313,7 @@ def _get_cutedsl_launcher():
         cluster_dim_m = grid_dim[0] // CLUSTER_SHAPE_MN[0]
         cluster_dim_n = grid_dim[1] // CLUSTER_SHAPE_MN[1]
 
-        # initialize thread block level swizzle
+        # Swizzle only the largest even-by-even prefix of the cluster grid.
         swizzle_m_size = cluster_dim_m // BLOCK_SWIZZLE_SIZE
         swizzle_n_size = cluster_dim_n // BLOCK_SWIZZLE_SIZE
         swizzle_m_bound = swizzle_m_size * BLOCK_SWIZZLE_SIZE
@@ -355,15 +355,22 @@ def _get_cutedsl_launcher():
 
         if warp_idx == TMA_WARP_ID:
             # Map the initial CLC cluster coordinate through a two-column
-            # thread-block swizzle. Incomplete edge groups stay unswizzled.
+            # thread-block swizzle. Work in cluster coordinates so both CTAs in
+            # the (2, 1) cluster remain attached to the same logical work tile.
             tma_cluster_m = block_m // CLUSTER_SHAPE_MN[0]
             tma_cluster_n = block_n // CLUSTER_SHAPE_MN[1]
+
+            # Split M into a two-row group and an in-group row. The source N
+            # parity selects which half of the destination M range receives the
+            # group, while the source M parity becomes the destination N parity.
             tma_m_local = (
                 tma_cluster_m // BLOCK_SWIZZLE_SIZE
                 + swizzle_m_size * (tma_cluster_n % BLOCK_SWIZZLE_SIZE)
             )
             tma_n_local = tma_cluster_m % BLOCK_SWIZZLE_SIZE
             tma_swizzle_group_n = tma_cluster_n // BLOCK_SWIZZLE_SIZE
+
+            # reverse M in every other N group
             tma_swizzled_m_candidate = cutlass.Int32(
                 cutlass.select_(
                     (tma_swizzle_group_n % 2) == 0,
@@ -374,6 +381,8 @@ def _get_cutedsl_launcher():
             tma_swizzled_n_candidate = (
                 tma_n_local + tma_swizzle_group_n * BLOCK_SWIZZLE_SIZE
             )
+
+            # keep coordinates outside the complete even by even region at their identity mapping
             tma_swizzled_cluster_m = cutlass.Int32(
                 cutlass.select_(
                     tma_cluster_m < swizzle_m_bound,
@@ -397,7 +406,7 @@ def _get_cutedsl_launcher():
                 )
             )
 
-            # Get the work coordinates of the cta
+            # restore the CTA's offset within its cluster after the cluster coordinate has been permuted
             tma_work_m = (
                 tma_swizzled_cluster_m * CLUSTER_SHAPE_MN[0] + cta_m_in_cluster
             )
@@ -477,7 +486,9 @@ def _get_cutedsl_launcher():
                     space="cta",
                 )
 
-                # Apply the same two-column mapping to the raw CLC response.
+                # Convert the CLC response to the physical CTA coordinate.
+                # Then, apply the same permutation as the launch coordinate before
+                # issuing the next TMA load.
                 tma_cluster_m = next_m // CLUSTER_SHAPE_MN[0]
                 tma_cluster_n = next_n // CLUSTER_SHAPE_MN[1]
                 tma_m_local = (
@@ -615,6 +626,8 @@ def _get_cutedsl_launcher():
                 )
                 scheduler_cluster_m = next_m // CLUSTER_SHAPE_MN[0]
                 scheduler_cluster_n = next_n // CLUSTER_SHAPE_MN[1]
+                # Remap each newly claimed physical coordinate before publishing its barriers.
+                # Consumers interpret those barriers as logical(swizzled) work-tile progress.
                 scheduler_m_local = (
                     scheduler_cluster_m // BLOCK_SWIZZLE_SIZE
                     + swizzle_m_size
@@ -672,7 +685,7 @@ def _get_cutedsl_launcher():
             clc_pipeline.producer_tail(clc_producer_state)
 
         if warp_idx == MMA_WARP_ID:
-            # Map the initial coordinate to the swizzled MMA work tile.
+            # map the initial coordinate to the swizzled MMA work tile
             mma_cluster_m = block_m // CLUSTER_SHAPE_MN[0]
             mma_cluster_n = block_n // CLUSTER_SHAPE_MN[1]
             mma_m_local = (
@@ -732,6 +745,8 @@ def _get_cutedsl_launcher():
                 )
                 next_cluster_m = next_m // CLUSTER_SHAPE_MN[0]
                 next_cluster_n = next_n // CLUSTER_SHAPE_MN[1]
+                # CLC always returns launch grid coordinates, so every response
+                # must pass through the permutation before selecting A/B tiles.
                 next_m_local = (
                     next_cluster_m // BLOCK_SWIZZLE_SIZE
                     + swizzle_m_size * (next_cluster_n % BLOCK_SWIZZLE_SIZE)
@@ -838,8 +853,8 @@ def _get_cutedsl_launcher():
                 mma_work_valid = next_work_valid
 
         if warp_idx < EPILOGUE_WARPS:
-            # Map this CTA's initial block coordinate to the two-column
-            # swizzled CTA-level output tile coordinate.
+            # Map this CTA's initial block coordinate to the two column
+            # swizzled CTA level output tile coordinate.
             tmem.relinquish_alloc_permit()
 
             epi_cluster_m = block_m // CLUSTER_SHAPE_MN[0]
@@ -1024,6 +1039,8 @@ def _get_cutedsl_launcher():
 
                 epi_cluster_m = next_m // CLUSTER_SHAPE_MN[0]
                 epi_cluster_n = next_n // CLUSTER_SHAPE_MN[1]
+                # Decode the next CLC assignment before constructing the output
+                # tensor slice for the following accumulator stage.
                 epi_m_local = (
                     epi_cluster_m // BLOCK_SWIZZLE_SIZE
                     + swizzle_m_size * (epi_cluster_n % BLOCK_SWIZZLE_SIZE)

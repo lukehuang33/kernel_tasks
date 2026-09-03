@@ -1,6 +1,6 @@
 """Blackwell Tensor Core GEMM with pipelined TMA and 2-SM MMA.
 
-Starts from kernel_5_multicast_2smmma and adds only the optimizations described
+Starts from kernel_5_multicast_2smmma and adds the optimizations described
 for Modular's kernel 6:
 
 - BF16 inputs
@@ -28,7 +28,7 @@ DTYPE_CHOICES = ("bfloat16",)
 ACCUMULATION_DTYPE = "float32"
 OUTPUT_DTYPE = "bfloat16"
 
-# Modular's kernels 5 and 6 give each CTA a 128 x 128 x 64 A/B SMEM tile. The two
+# Each CTA gets a 128 x 128 x 64 A/B SMEM tile. The two
 # CTAs in a pair jointly issue a 256 x 256 x 16 MMA instruction, and each CTA
 # owns a 128 x 256 slice of the output.
 SMEM_TILE_M = 128
@@ -46,14 +46,12 @@ EPILOGUE_THREADS = EPILOGUE_WARPS * 32
 THREADS_PER_CTA = 6 * 32
 CTA_GROUP_SIZE = 2
 CLUSTER_SHAPE_MN = (2, 1)
-# Five A/B stages consume 160 KiB per CTA and match the circular-buffer depth
-# selected by Mojo kernel 6. EPI_STAGES stays at one to preserve kernel 5's
+# Five A/B stages consume 160 KiB per CTA. EPI_STAGES stays at 1 to preserve kernel 5's
 # output path rather than adopting kernel 7's double buffer.
 AB_STAGES = 5
 ACC_STAGES = 1
 EPI_STAGES = 1
-# Match Modular's kernel-6 benchmark: warm up with 20 ordinary launches, then
-# time 50 ordinary launches as one aggregate and divide by the run count.
+
 WARMUP_ITERATIONS = 20
 TIMED_ITERATIONS = 50
 
@@ -194,7 +192,7 @@ def _get_cutedsl_launcher():
 
         # Both CTAs issue their half-loads, but CTA-group-two TMA completes the
         # leader CTA's transaction barrier. It must therefore expect both CTAs'
-        # A and B byte counts, matching expected_bytes in Modular's kernel 5.
+        # A and B byte counts.
         num_tma_copy_bytes = (
             cute.size_in_bytes(
                 io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
@@ -648,10 +646,7 @@ def run_matmul_local(
         .mark_compact_shape_dynamic(mode=1, divisibility=dim)
     )
 
-    # Compile once to a fixed JIT executor before warmup/timing. Calling the
-    # decorated @cute.jit function directly would repeatedly enter CuTeDSL's
-    # implicit dispatch path, unlike Mojo's already-compiled benchmark closure.
-    # print("[kernel6] before launcher construction", flush=True)
+    # Compile once to a fixed JIT executor before warmup/timing.
     host_function = cute.compile(
         _get_cutedsl_launcher(),
         a_tensor,
@@ -659,15 +654,11 @@ def run_matmul_local(
         c_tensor,
         current_stream,
     )
-    # print("[kernel6] after launcher construction", flush=True)
 
     # Compilation above pays the JIT cost; warmups flush lazy runtime costs.
     for _ in range(WARMUP_ITERATIONS):
-        # print("[kernel6] before warmup launch", flush=True)
         host_function(a_tensor, b_tensor, c_tensor, current_stream)
-    # print("[kernel6] before warmup sync", flush=True)
     torch_stream.synchronize()
-    # print("[kernel6] after warmup sync", flush=True)
 
     timed_matmul_region = profile_region or nullcontext
     profiler_enabled = profile_region is not None
@@ -677,16 +668,12 @@ def run_matmul_local(
     end_event = torch.cuda.Event(enable_timing=True)
 
     with timed_matmul_region():
-        # print("[kernel6] before timed launch", flush=True)
         start_event.record(torch_stream)
         for _ in range(timed_iterations):
             host_function(a_tensor, b_tensor, c_tensor, current_stream)
         end_event.record(torch_stream)
-        # print("[kernel6] before timed sync", flush=True)
         torch_stream.synchronize()
-        # print("[kernel6] after timed sync", flush=True)
 
-    # print("[kernel6] before elapsed time read", flush=True)
     total_elapsed_ms = start_event.elapsed_time(end_event)
     elapsed_ms = total_elapsed_ms / timed_iterations
     elapsed_s = elapsed_ms / 1000.0
@@ -701,11 +688,8 @@ def run_matmul_local(
     torch.testing.assert_close(c, reference, atol=1e-2, rtol=1e-2)
     max_abs_error = float((c.float() - reference.float()).abs().max().item())
 
-    # print("[kernel6] before checksum", flush=True)
     result_checksum = float(c.float().sum().item())
-    # print("[kernel6] after checksum", flush=True)
 
-    # print("[kernel6] returning result", flush=True)
     return {
         "status": "success",
         "kernel": "kernel6_2sm_pipelining",

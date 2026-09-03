@@ -1,7 +1,7 @@
 """Blackwell Tensor Core GEMM with stmatrix packing and TMA stores.
 
 Keeps the same CuTeDSL mainloop as kernel_3_swizzling and modifies
-the epilogue to match Modular's kernel 4 structure:
+the epilogue to match Modular's kernel 4 structure, which this repo is heavily based off of:
 
 - BF16 inputs
 - FP32 accumulation in tensor memory
@@ -508,7 +508,6 @@ def run_matmul_local(
     )
 
     # Compile once to a fixed JIT executor before warmup/timing.
-    # print("[kernel_4] before launcher construction", flush=True)
     host_function = cute.compile(
         _get_cutedsl_launcher(),
         a_tensor,
@@ -516,15 +515,11 @@ def run_matmul_local(
         c_tensor,
         current_stream,
     )
-    # print("[kernel_4] after launcher construction", flush=True)
 
     # Compilation above pays the JIT cost; warmups flush lazy runtime costs.
     for _ in range(WARMUP_ITERATIONS):
-        # print("[kernel_4] before warmup launch", flush=True)
         host_function(a_tensor, b_tensor, c_tensor, current_stream)
-    # print("[kernel_4] before warmup sync", flush=True)
     torch_stream.synchronize()
-    # print("[kernel_4] after warmup sync", flush=True)
 
     timed_matmul_region = profile_region or nullcontext
     profiler_enabled = profile_region is not None
@@ -534,27 +529,20 @@ def run_matmul_local(
     end_event = torch.cuda.Event(enable_timing=True)
 
     with timed_matmul_region():
-        # print("[kernel_4] before timed launch", flush=True)
         start_event.record(torch_stream)
         for _ in range(timed_iterations):
             host_function(a_tensor, b_tensor, c_tensor, current_stream)
         end_event.record(torch_stream)
-        # print("[kernel_4] before timed sync", flush=True)
         torch_stream.synchronize()
-        # print("[kernel_4] after timed sync", flush=True)
 
-    # print("[kernel_4] before elapsed time read", flush=True)
     total_elapsed_ms = start_event.elapsed_time(end_event)
     elapsed_ms = total_elapsed_ms / timed_iterations
     elapsed_s = elapsed_ms / 1000.0
     flops = 2 * dim * dim * dim
     tflops = flops / elapsed_s / 1e12 if elapsed_s > 0 else 0.0
 
-    # print("[kernel_4] before checksum", flush=True)
     result_checksum = float(c.float().sum().item())
-    # print("[kernel_4] after checksum", flush=True)
 
-    # print("[kernel_4] returning result", flush=True)
     return {
         "status": "success",
         "kernel": "kernel_4_stmatrix",
